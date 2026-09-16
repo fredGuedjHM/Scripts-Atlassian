@@ -1,0 +1,11 @@
+# Credentials et identifiants
+secrets/
+
+# Fichiers de travail temporaires
+cache/
+logs/
+output/
+scripts/
+
+# Résultats générés
+exports/
