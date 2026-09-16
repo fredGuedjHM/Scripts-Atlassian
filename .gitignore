@@ -9,3 +9,7 @@ scripts/
 
 # Résultats générés
 exports/
+
+# Fichiers temporaires
+*.tmp
+*.log
