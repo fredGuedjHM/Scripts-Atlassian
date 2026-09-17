@@ -1,4 +1,4 @@
-# 🛠️ Scripts d'Administration & Audit Atlassian Cloud (Jira & Confluence)
+﻿# 🛠️ Scripts d'Administration & Audit Atlassian Cloud (Jira & Confluence)
 
 Ce référentiel regroupe les outils d'automatisation, d'audit et d'administration développés en **PowerShell** pour la gestion de la gouvernance, des habilitations et des migrations de groupes sur **Jira Cloud** et **Confluence Cloud** (*instance jiradot*).
 
@@ -138,8 +138,13 @@ Scripts Atlassian/
 +--- Suppression-Comptes-Desactives.ps1
 +--- Suspend-OldUsers-WithNoApps.ps1
 +--- Test-ConfluenceSpacePermissionsDiagnostic.ps1
++--- audit-non-dsim-dsit-users-access.ps1
 ```
-
+Commit : "feat(audit): ajout des scripts d'audit des groupes Jira Assets et espaces Confluence"
+| Script | Description | Cibles |
+| :--- | :--- | :--- |
+| **`audit-groupe-jira-assets.ps1`** | Analyse des membres d'un groupe Jira : autres groupes, équipes Tempo et données RH du Référentiel Personne (RP). | Jira Cloud, Assets (JSM), Tempo |
+| **`audit-groupe-confluence-spaces.ps1`** | Analyse d'impact sur les espaces Confluence : détection des accès exclusifs et risques d'espaces orphelins. | Confluence Cloud |
 
 ---
 
@@ -185,3 +190,25 @@ $jiraConfig = [pscustomobject]@{
 if (-not (Test-Path ".\secrets")) { New-Item -ItemType Directory -Path ".\secrets" }
 $jiraConfig | Export-Clixml -Path ".\secrets\jira-jiradot.cred.xml"
 
+## 👥 Audit des Collaborateurs Hors DSIM / DSIT (`audit-non-dsim-dsit-users-access.ps1`)
+### Objectif
+Identifier et cartographier les habilitations (projets Jira avec rôles, espaces Confluence avec nature des droits) de tous les utilisateurs internes et prestataires actifs qui **n'appartiennent à aucun groupe d'habilitation DSIM ou DSIT**.
+### Données extraites & Règles de gestion
+* **Filtre population** :
+  * Comptes actifs et humains (`active = true`, `accountType = atlassian`).
+  * Domaines de messagerie officiels : `@harmonie-mutuelle.fr`, `@prestataire.sihm.fr`, `@prestataire.harmonie-mutuelle.fr`.
+  * Exclusion automatique en mémoire $O(1)$ de tout membre d'au moins un groupe contenant `DSIM` ou `DSIT`.
+* **Projets Jira & Rôles** : Liste des projets accessibles avec les rôles associés (directs ou hérités des groupes), format `PROJ (Rôle 1, Rôle 2)`.
+* **Espaces Confluence Simplifiés** :
+  * Espaces globaux uniquement (exclusion stricte des espaces personnels `~`).
+  * Format synthétique : `CLÉ [C|R|G]`
+    * **`C`** (*Create / Edit / Admin*) : Droits d'écriture, création ou administration (`editspace`, `createpage`, `adminspace`, `createattachment`).
+    * **`R`** (*Read Only*) : Consultation simple (`viewspace` / `readspace`).
+    * **`G`** (*Guest / Invité*) : Accès invité restreint (`guest`).
+* **Tri des résultats** : Classement systématique par ordre alphabétique (`DisplayName`).
+### Exécution
+```powershell
+# Exécution par défaut (15 threads parallèles)
+.\audit-non-dsim-dsit-users-access.ps1
+# Ajustement du niveau de parallélisme si besoin
+.\audit-non-dsim-dsit-users-access.ps1 -ThrottleLimit 20
