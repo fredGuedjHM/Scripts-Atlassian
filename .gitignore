@@ -13,3 +13,5 @@ exports/
 # Fichiers temporaires
 *.tmp
 *.log
+*.csv
+*.xlsx

@@ -2,17 +2,15 @@
 .SYNOPSIS
     Audit ultra-rapide et parallélisé des accès Jira & Confluence pour les collaborateurs hors DSIM / DSIT.
 .DESCRIPTION
-    - Tri alphabétique systématique par Nom d'affichage (DisplayName).
-    - Confluence simplifié : Espaces globaux uniquement (personnels ~ exclus), format "CLE [C|R|G]".
-        * C = Create / Edit / Admin
-        * R = Read Only
-        * G = Guest / Invité
-    - Parallélisation multi-threads (RunspacePool x15).
-    - Filtrage strict sur les domaines de messagerie :
+    - Filtrage strict sur les domaines :
         * @harmonie-mutuelle.fr
         * @prestataire.sihm.fr
         * @prestataire.harmonie-mutuelle.fr
+    - Exclusion des comptes techniques / fantômes sans aucun groupe ni droit.
     - Exclusion automatique en mémoire O(1) des membres de groupes DSIM/DSIT.
+    - Tri alphabétique systématique par DisplayName.
+    - Confluence simplifié : Espaces globaux uniquement (personnels ~ exclus), format "CLE [C|R|G]".
+    - Parallélisation multi-threads (RunspacePool x15).
     - Export CSV UTF-8 avec BOM (compatible Excel).
 #>
 
@@ -23,10 +21,13 @@ param(
 )
 
 # ======================================================================
-# 1. INITIALISATION PROXY, TLS & ENCODAGE
+# 1. INITIALISATION PROXY, TLS & ENCODAGE (COMPATIBLE ISE & CONSOLE)
 # ======================================================================
 [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 -bor [System.Net.SecurityProtocolType]::Tls13
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+} catch {}
 
 if (-not $ProxyUrl) {
     try {
@@ -121,7 +122,10 @@ foreach ($q in $searchQueries) {
     } catch {}
 }
 
-Write-Info "$($dsiGroupNames.Count) groupes DSIM/DSIT identifiés pour l'exclusion."
+Write-Info "$($dsiGroupNames.Count) groupes DSIM/DSIT identifiés pour l'exclusion :"
+foreach ($gn in ($dsiGroupNames | Sort-Object)) {
+    Write-Host "   -> $gn" -ForegroundColor DarkGray
+}
 
 # ======================================================================
 # ÉTAPE 2/5 : RÉCUPÉRATION DES MEMBRES DSIM/DSIT (INDEX O(1))
@@ -153,18 +157,21 @@ foreach ($gName in $dsiGroupNames) {
     }
 }
 
-Write-Info "$($dsiUserAccountIds.Count) utilisateurs DSIM/DSIT indexés (exclus automatiquement)."
+Write-Info "$($dsiUserAccountIds.Count) utilisateurs uniques DSIM/DSIT indexés (exclus automatiquement)."
 
 # ======================================================================
 # ÉTAPE 3/5 : EXTRACTION CIBLÉE & PARALLÉLISATION DES GROUPES
 # ======================================================================
-Write-Progress -Activity "Audit Collaborateurs hors DSIM/DSIT" -Status "Étape 3/$totalSteps : Filtrage des emails et extraction ciblée..." -PercentComplete 30
-Write-Info "Filtrage des utilisateurs actifs sur les domaines harmonie-mutuelle.fr / prestataire.sihm.fr..."
+Write-Progress -Activity "Audit Collaborateurs hors DSIM/DSIT" -Status "Étape 3/$totalSteps : Extraction des utilisateurs actifs..." -PercentComplete 30
+Write-Info "Extraction des comptes actifs hors DSIM/DSIT..."
 
-$validEmailPattern = '(?i)@(harmonie-mutuelle\.fr|prestataire\.sihm\.fr|prestataire\.harmonie-mutuelle\.fr)$'
-
-$targetUsers = New-Object System.Collections.ArrayList
+$targetCandidates = New-Object System.Collections.ArrayList
 $startAt = 0; $maxRes = 50
+
+# Domaines autorisés
+$validEmailRegex = '(?i)@(harmonie-mutuelle\.fr|prestataire\.sihm\.fr|prestataire\.harmonie-mutuelle\.fr)$'
+# Domaines parasites à rejeter immédiatement
+$forbiddenDomainRegex = '(?i)@(groupevyv\.onmicrosoft\.com|atlassian\.com|bot|automation)'
 
 while ($true) {
     $uUrl = "$baseUrl/rest/api/3/users/search?startAt=$startAt&maxResults=$maxRes"
@@ -177,15 +184,19 @@ while ($true) {
     foreach ($u in $uResp) {
         if (-not $u.active -or ($u.accountType -and $u.accountType -ine "atlassian")) { continue }
 
-        $email = [string]$u.emailAddress
-        if (-not ($email -match $validEmailPattern)) { continue }
-
         $accId = [string]$u.accountId
         if ($dsiUserAccountIds.Contains($accId)) { continue }
 
-        [void]$targetUsers.Add([pscustomobject]@{
+        $dispName = Repair-DoubleUtf8 ([string]$u.displayName)
+        $email    = [string]$u.emailAddress
+
+        # Rejet immédiat si le DisplayName est une adresse hors domaine cible (ex: gpafi@groupevyv...)
+        if ($dispName -match $forbiddenDomainRegex) { continue }
+        if ($email -and $email -match $forbiddenDomainRegex) { continue }
+
+        [void]$targetCandidates.Add([pscustomobject]@{
             AccountId   = $accId
-            DisplayName = Repair-DoubleUtf8 ([string]$u.displayName)
+            DisplayName = $dispName
             Email       = $email
             Groups      = @()
         })
@@ -195,15 +206,15 @@ while ($true) {
     $startAt += $uResp.Count
 }
 
-Write-Info "Collaborateurs actifs cibles retenus : $($targetUsers.Count)"
+Write-Info "$($targetCandidates.Count) candidats actifs à analyser..."
 
-if ($targetUsers.Count -eq 0) {
+if ($targetCandidates.Count -eq 0) {
     Write-Progress -Activity "Audit Collaborateurs" -Completed
-    Write-Warn "Aucun collaborateur correspondant aux critères trouvé."
+    Write-Warn "Aucun candidat trouvé."
     exit 0
 }
 
-Write-Info "Extraction multi-threadée des groupes ($ThrottleLimit threads)..."
+Write-Info "Résolution multi-threadée des groupes et vérification des profils ($ThrottleLimit threads)..."
 
 $workerUserBlock = {
     param(
@@ -226,6 +237,8 @@ $workerUserBlock = {
     }
 
     $groups = @()
+    $email  = ""
+
     $params = @{
         Uri     = "$BaseUrl/rest/api/3/user?accountId=$AccountId&expand=groups"
         Method  = "Get"
@@ -238,6 +251,7 @@ $workerUserBlock = {
 
     try {
         $resp = Invoke-RestMethod @params
+        if ($resp.emailAddress) { $email = [string]$resp.emailAddress }
         if ($resp.groups -and $resp.groups.items) {
             $groups = @($resp.groups.items | ForEach-Object { Repair-TextEncoding ([string]$_.name) })
         }
@@ -245,6 +259,7 @@ $workerUserBlock = {
 
     return [pscustomobject]@{
         AccountId = $AccountId
+        Email     = $email
         Groups    = $groups
     }
 }
@@ -253,24 +268,25 @@ $userPool = [runspacefactory]::CreateRunspacePool(1, $ThrottleLimit)
 $userPool.Open()
 
 $tasks = New-Object System.Collections.ArrayList
-foreach ($tu in $targetUsers) {
+foreach ($tc in $targetCandidates) {
     $ps = [powershell]::Create()
     $ps.RunspacePool = $userPool
     [void]$ps.AddScript($workerUserBlock)
-    [void]$ps.AddArgument($tu.AccountId)
+    [void]$ps.AddArgument($tc.AccountId)
     [void]$ps.AddArgument($baseUrl)
     [void]$ps.AddArgument($authHeaders)
     [void]$ps.AddArgument($ProxyUrl)
     [void]$ps.AddArgument($true)
 
     [void]$tasks.Add([pscustomobject]@{
-        User        = $tu
+        Candidate   = $tc
         PowerShell  = $ps
         AsyncResult = $ps.BeginInvoke()
     })
 }
 
 $doneCount = 0
+$targetUsers = New-Object System.Collections.ArrayList
 $allTargetGroupNamesLower = New-Object System.Collections.Generic.HashSet[string]
 
 while ($doneCount -lt $tasks.Count) {
@@ -286,10 +302,23 @@ while ($doneCount -lt $tasks.Count) {
 
             if ($result -and $result[0]) {
                 $resObj = $result[0]
-                $t.User.Groups = @($resObj.Groups)
+                $resolvedEmail = if ($resObj.Email) { $resObj.Email } else { $t.Candidate.Email }
+                $userGroups    = @($resObj.Groups)
 
-                foreach ($g in $t.User.Groups) {
-                    [void]$allTargetGroupNamesLower.Add($g.Trim().ToLower())
+                # RÈGLE DE FILTRAGE STRICT :
+                # 1. Si un email est connu, il doit appartenir aux domaines HM/SIHM
+                # 2. Rejet des comptes rejetés par regex ou sans groupe Jira
+                $isValidMail = ($resolvedEmail -match $validEmailRegex)
+                $isForbidden = ($resolvedEmail -match $forbiddenDomainRegex) -or ($t.Candidate.DisplayName -match $forbiddenDomainRegex)
+
+                if ($isValidMail -and -not $isForbidden) {
+                    $t.Candidate.Email = $resolvedEmail
+                    $t.Candidate.Groups = $userGroups
+                    [void]$targetUsers.Add($t.Candidate)
+
+                    foreach ($g in $userGroups) {
+                        [void]$allTargetGroupNamesLower.Add($g.Trim().ToLower())
+                    }
                 }
             }
             $doneCount++
@@ -307,6 +336,13 @@ while ($doneCount -lt $tasks.Count) {
 
 $userPool.Close()
 $userPool.Dispose()
+
+Write-Info "Collaborateurs HM/Prestataires validés : $($targetUsers.Count)"
+
+if ($targetUsers.Count -eq 0) {
+    Write-Warn "Aucun collaborateur correspondant aux critères."
+    exit 0
+}
 
 # ======================================================================
 # ÉTAPE 4/5 : CARTOGRAPHIE PROJETS JIRA & RÔLES (PARALLÉLISÉE)
@@ -548,12 +584,11 @@ function Get-SimplifiedPermission([System.Collections.Generic.HashSet[string]]$o
 }
 
 # ======================================================================
-# COMPILATION DU RAPPORT FINAL (TRI PAR ORDRE ALPHABÉTIQUE)
+# COMPILATION DU RAPPORT FINAL (TRI ALPHABÉTIQUE STRICT & EXCLUSION FANTÔMES)
 # ======================================================================
 Write-Progress -Activity "Audit Collaborateurs hors DSIM/DSIT" -Status "Finalisation et tri alphabétique..." -PercentComplete 95
 $reportRows = New-Object System.Collections.ArrayList
 
-# Tri préalable des utilisateurs par nom d'affichage
 $sortedUsers = @($targetUsers | Sort-Object DisplayName)
 
 foreach ($tu in $sortedUsers) {
@@ -610,6 +645,11 @@ foreach ($tu in $sortedUsers) {
         }
     }
     $confAccessStr = if ($confAccessList.Count -gt 0) { $confAccessList -join " | " } else { "(aucun espace)" }
+
+    # Exclusion des comptes fantômes sans aucun groupe ni droit
+    if ($userGroupNames.Count -eq 0 -and $jiraProjMap.Count -eq 0 -and $confSpaceMap.Count -eq 0) {
+        continue
+    }
 
     $groupsStr = if ($userGroupNames.Count -gt 0) { ($userGroupNames | Sort-Object) -join " | " } else { "(aucun groupe)" }
 
