@@ -139,6 +139,7 @@ Scripts Atlassian/
 +--- Suspend-OldUsers-WithNoApps.ps1
 +--- Test-ConfluenceSpacePermissionsDiagnostic.ps1
 +--- audit-non-dsim-dsit-users-access.ps1
++--- audit-connected-apps-usage.ps1
 ```
 Commit : "feat(audit): ajout des scripts d'audit des groupes Jira Assets et espaces Confluence"
 | Script | Description | Cibles |
@@ -212,3 +213,65 @@ Identifier et cartographier les habilitations (projets Jira avec rôles, espaces
 .\audit-non-dsim-dsit-users-access.ps1
 # Ajustement du niveau de parallélisme si besoin
 .\audit-non-dsim-dsit-users-access.ps1 -ThrottleLimit 20
+
+---
+
+## 4. Audit des Applications Connectées & Préconisations d'Arbitrage
+
+### 🎯 Objectif
+Cartographier l'ensemble des applications connectées, modules Marketplace, extensions Forge et intégrations SaaS (Jira Cloud), évaluer leur empreinte de données réelle, et fournir une préconisation d'arbitrage (conserver, arbitrer, désinstaller) avec l'impact associé.
+
+* **Fichier :** `audit-connected-apps-usage.ps1`
+* **Mode d'exécution :** **100% Dry-Run** (lecture seule, aucune action de modification ou de désinstallation)
+* **Temps d'exécution moyen :** ~2 à 3 secondes
+* **Fichier d'export généré :** `exports/Audit_Connected_Apps_Categorise_YYYYMMDD_HHMMSS.csv`
+
+---
+
+### ⚙️ Périmètre & Détections multi-technologies
+
+Le script analyse et croise les sources suivantes :
+1. **Modules UPM (Universal Plugin Manager) :** Détection des plugins Marketplace et modules installés.
+2. **Atlassian Connect & Forge :** Détection des extensions SaaS et apps modernes (Forge Cloud).
+3. **Modèle de données Jira (Champs & Types de tickets) :**
+   * **Tempo Timesheets & Planner :** Détection des champs Forge (`Tempo Team`, `Account`, etc.).
+   * **Xray Test Management :** Détection des 6 types de tickets natifs Xray (`Test`, `Test Execution`, `Test Plan`, `Test Set`, `Precondition`, `Sub Test Execution`).
+   * **Applications tierces :** Figma, Links Hierarchy, Draw.io, etc.
+
+---
+
+### 🏷️ Catégorisation & Grille de décision
+
+Chaque composant est automatiquement qualifié selon 3 catégories :
+
+| Catégorie | Description | Préconisation par défaut | Risque en cas de suppression |
+| :--- | :--- | :--- | :--- |
+| **🛑 Socle Système Atlassian** | Modules natifs du moteur Jira (*Streams, Forms/Proforma, Roadmaps, Toolkit...*) | 🟢 **Conserver obligatoirement** | **CRITIQUE** : Altération des fonctionnalités natives Jira. |
+| **🔵 Connecteur Optionnel Atlassian** | Ponts vers d'autres outils (*Teams, Slack, Opsgenie, Statuspage...*) | 🔵 / ⚪ **Arbitrer selon les outils utilisés** | **FAIBLE à MOYEN** : Perte de la liaison avec le service externe. |
+| **🟢 Application Métier Tierce** | Outils Marketplace / Forge (*Tempo, Xray, Figma, Links Hierarchy...*) | 🟢 / 🟡 **Conserver si souscription active** | **ÉLEVÉ à CRITIQUE** : Perte des données métier ou de la saisie des temps/tests. |
+
+---
+
+### 📊 Colonnes du fichier CSV exporté
+
+Le fichier CSV produit est encodé en **UTF-8 avec BOM** (délimiteur point-virgule `;`) pour une ouverture directe et sans altération des accents dans Microsoft Excel :
+
+1. **`Nom`** : Nom d'affichage de l'application ou du module.
+2. **`Cle`** : Clé technique unique (`key` / `addon_key`).
+3. **`Editeur`** : Nom de l'éditeur (*Atlassian, Tempo Software, Idevio / Xpand IT, Figma, Inc., etc.*).
+4. **`CategorieModule`** : Socle Système / Connecteur Optionnel / Application Métier Tierce.
+5. **`InstalleParUser`** : Mode d'installation (*Oui / Souscription Cloud Organisation*).
+6. **`Empreinte`** : Champs personnalisés rattachés, types de tickets configurés ou intégration SaaS.
+7. **`Preconisation`** : Recommandation opérationnelle d'arbitrage.
+8. **`ImpactDesinstallation`** : Conséquences et niveau de risque en cas de retrait.
+
+---
+
+### 🚀 Exécution
+
+```powershell
+# Exécution standard (Dry-Run avec détection automatique du proxy)
+.\audit-connected-apps-usage.ps1
+
+# Exécution en spécifiant explicitement le proxy d'entreprise
+.\audit-connected-apps-usage.ps1 -ProxyUrl "http://prc37cti1.hm.dm.ad:8080"
