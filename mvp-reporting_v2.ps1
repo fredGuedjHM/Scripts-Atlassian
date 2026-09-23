@@ -358,23 +358,72 @@ $groupsCachePath    = Join-Path $cacheDir "audit_user_groups.json"
 $jiraUsersCachePath = Join-Path $cacheDir "audit_jira_users.json"
 
 # ======================================================================
-# CHARGEMENT : WORKLOGS
+# CHARGEMENT : WORKLOGS (Jour par jour avec barre de progression)
 # ======================================================================
 $worklogs = $null
 if ($UseCache_Worklogs) { $worklogs = Load-Json -Path $worklogCacheFile }
 if (-not $worklogs) {
     $worklogs = @()
-    $url = "https://api.eu.tempo.io/4/worklogs?from=$fromStr&to=$toStr"
-    while ($true) {
-        $resp = Invoke-ApiGet -Url $url -Headers $tempoHeaders
-        if ($resp.results) { $worklogs += $resp.results }
-        if ($resp.metadata -and $resp.metadata.next) { $url = $resp.metadata.next }
-        else { break }
-    }
-    Save-Json -Path $worklogCacheFile -Object $worklogs
-    Write-Info "Worklogs récupérés: $($worklogs.Count)"
-} else { Write-Info "Worklogs cache: $($worklogs.Count)" }
+    
+    $dtStart = [datetime]::ParseExact($fromStr, "yyyy-MM-dd", [System.Globalization.CultureInfo]::InvariantCulture)
+    $dtEnd   = [datetime]::ParseExact($toStr,   "yyyy-MM-dd", [System.Globalization.CultureInfo]::InvariantCulture)
+    $totalDays = ($dtEnd - $dtStart).Days + 1
+    
+    $currentDay = $dtStart.Date
+    $dayIndex = 0
 
+    while ($currentDay -le $dtEnd.Date) {
+        $dayIndex++
+        $dayStr = $currentDay.ToString("yyyy-MM-dd")
+        $pct = [int](($dayIndex / $totalDays) * 100)
+        
+        Write-Progress -Activity "Récupération Tempo Worklogs" `
+                       -Status "Jour $dayIndex/$totalDays ($dayStr) - $($worklogs.Count) worklogs cumulés" `
+                       -PercentComplete $pct
+        
+        $url = "https://api.tempo.io/4/worklogs?from=$dayStr&to=$dayStr&limit=500"
+        
+        while ($true) {
+            $resp = $null
+            $retryCount = 0
+            $maxRetries = 3
+            
+            while (-not $resp -and $retryCount -lt $maxRetries) {
+                try {
+                    $resp = Invoke-ApiGet -Url $url -Headers $tempoHeaders
+                } catch {
+                    $retryCount++
+                    Write-Log "Tentative $retryCount/$maxRetries pour $url (attente 2s)" "WARN"
+                    Start-Sleep -Seconds 2
+                }
+            }
+            
+            if (-not $resp) {
+                Write-Warn "Données incomplètes pour le $dayStr (après $maxRetries tentatives)"
+                break
+            }
+            
+            if ($resp.results) { 
+                $worklogs += $resp.results 
+            }
+            
+            if ($resp.metadata -and $resp.metadata.next) { 
+                $url = $resp.metadata.next 
+                Start-Sleep -Milliseconds 150
+            } else { 
+                break 
+            }
+        }
+        
+        $currentDay = $currentDay.AddDays(1)
+    }
+    
+    Write-Progress -Activity "Récupération Tempo Worklogs" -Completed
+    Save-Json -Path $worklogCacheFile -Object $worklogs
+    Write-Info "Total Worklogs récupérés : $($worklogs.Count)"
+} else { 
+    Write-Info "Worklogs (depuis le cache) : $($worklogs.Count)" 
+}
 # ======================================================================
 # CHARGEMENT : TEAMS
 # ======================================================================
@@ -383,9 +432,19 @@ if ($UseCache_Teams) { $teamsData = Load-Json -Path $teamsCacheFile }
 if (-not $teamsData) {
     $teamsData = @()
     $url = "https://api.tempo.io/4/teams"
+    Write-Info "Récupération des équipes Tempo..."
+    
     while ($true) {
         $resp = Invoke-ApiGet -Url $url -Headers $tempoHeaders
-        foreach ($t in ($resp.results | ForEach-Object { $_ })) {
+        $teamList = @($resp.results | ForEach-Object { $_ })
+        $tIdx = 0
+        
+        foreach ($t in $teamList) {
+            $tIdx++
+            Write-Progress -Activity "Chargement des équipes Tempo" `
+                           -Status "Équipe $tIdx/$($teamList.Count) : $($t.name)" `
+                           -PercentComplete ([int](($tIdx / [Math]::Max(1, $teamList.Count)) * 100))
+
             $mResp = Invoke-ApiGet -Url "$($t.self)/members" -Headers $tempoHeaders
             $memberIds = @(); $memberDates = @{}
             foreach ($m in ($mResp.results | ForEach-Object { $_ })) {
@@ -406,6 +465,7 @@ if (-not $teamsData) {
         if ($resp.metadata -and $resp.metadata.next) { $url = $resp.metadata.next }
         else { break }
     }
+    Write-Progress -Activity "Chargement des équipes Tempo" -Completed
     Save-Json -Path $teamsCacheFile -Object $teamsData
     Write-Info "Teams récupérées: $($teamsData.Count)"
 } else { Write-Info "Teams cache: $($teamsData.Count)" }
@@ -424,6 +484,7 @@ if ($UseCache_Teams) {
     }
 }
 if ($workloadSchemeMap.Count -eq 0) {
+    Write-Info "Récupération des régimes horaires (Workload Schemes)..."
     $wsUrl = "https://api.tempo.io/4/workload-schemes"
     while ($true) {
         $resp = Invoke-ApiGet -Url $wsUrl -Headers $tempoHeaders
@@ -458,112 +519,197 @@ $userWorkloadDays = Load-WorkloadSchemeDays `
     -UseCache $UseCache_Teams
 
 # ======================================================================
-# CHARGEMENT : ASSETS (v2.1 — gateway + dictionnaire objectTypeAttributes)
+# CHARGEMENT : ASSETS (v2.3 — Découverte dynamique RP + Compatibilité types)
 # ======================================================================
 $assetUsers = @()
-if (-not $SkipAssets) {
-    if ($UseCache_Assets) {
-        $cached = Load-Json -Path $assetsCacheFile
-        if ($cached) { $assetUsers = $cached; Write-Info "Assets cache: $($assetUsers.Count)" }
-    }
-    if ($assetUsers.Count -eq 0) {
-        $assetsBaseUrl = "$jiraBaseUrl/gateway/api/jsm/assets/workspace/$AssetsWorkspaceId/v1/object/aql"
-        $aql = '(objectType = Employé OR objectType = Prestataire)'
-        $startAt = 0; $maxResults = 50; $isLast = $false
 
-        $wantedMap = @{
-            "Compte Jira"    = "Compte Jira"
-            "Direction"      = "Direction"
-            "Nom"            = "Nom"
-            "Prénom"         = "Prénom"
-            "Date Entrée"    = "Date Entrée"
-            "Date PLD"       = "Date PLD"
-            "Type ressource" = "Type ressource"
-            "Statut"         = "Statut"
-            "Tarif € TTC"   = "Tarif € TTC"
+if (-not $SkipAssets) {
+    if ($UseCache_Assets -and $assetsCacheFile -and (Test-Path $assetsCacheFile)) {
+        $cached = Load-Json -Path $assetsCacheFile
+        if ($cached) { 
+            $assetUsers = @($cached)
+            Write-Info "Assets cache: $($assetUsers.Count)" 
         }
-        $dateAttrs = @("Date Entrée", "Date PLD")
+    }
+
+    if ($assetUsers.Count -eq 0) {
+        Write-Info "Interrogation du référentiel Assets (AQL avec découverte dynamique)..."
+        
+        $assetsWorkspaceUrl = "$jiraBaseUrl/gateway/api/jsm/assets/workspace/$AssetsWorkspaceId/v1"
+        $assetsAqlUrl       = "$assetsWorkspaceUrl/object/aql"
+        $aql                = '(objectType = Employé OR objectType = Prestataire OR objectTypeId = 6)'
+        
+        # 1. Pré-chargement du dictionnaire d'attributs global via le schéma Assets
+        $attrDict = @{} # [string]$attrId -> [string]$cleanName
+        
+        # Découverte du schéma d'attributs RP (ObjectType 6)
+        foreach ($otId in @(6)) {
+            try {
+                $schemaUrl = "$assetsWorkspaceUrl/objecttype/$otId/attributes"
+                $attrDefs = Invoke-ApiGet -Url $schemaUrl -Headers $jiraHeaders
+                if ($attrDefs) {
+                    foreach ($def in $attrDefs) {
+                        if ($def.id -and $def.name) {
+                            $attrDict[[string]$def.id] = [string]$def.name
+                        }
+                    }
+                }
+            } catch {
+                Write-Debug "Découverte préalable ObjectType $otId ignorée : $($_.Exception.Message)"
+            }
+        }
+
+        $startAt    = 0
+        $maxResults = 50
+        $isLast     = $false
+        $collectedUsers = New-Object System.Collections.ArrayList
 
         while (-not $isLast) {
-            $url = '{0}?startAt={1}&maxResults={2}&includeAttributes=true' -f $assetsBaseUrl, $startAt, $maxResults
-            try { $resp = Invoke-AssetsAqlPost -Url $url -Headers $jiraHeaders -AqlQuery $aql }
-            catch { Write-ErrLog "Assets AQL échoué (startAt=$startAt)."; break }
+            Write-Progress -Activity "Récupération des Assets (CMDB)" `
+                           -Status "Chargement: $($collectedUsers.Count) collaborateurs récupérés (startAt=$startAt)..." `
+                           -PercentComplete -1
+
+            $url = '{0}?startAt={1}&maxResults={2}&includeAttributes=true' -f $assetsAqlUrl, $startAt, $maxResults
+            
+            try { 
+                $resp = Invoke-AssetsAqlPost -Url $url -Headers $jiraHeaders -AqlQuery $aql 
+            } catch { 
+                Write-ErrLog "Assets AQL échoué (startAt=$startAt): $($_.Exception.Message)"
+                break 
+            }
+
             if (-not $resp) { break }
 
-            # Dictionnaire id → nom depuis objectTypeAttributes (racine de la réponse)
-            $attrDict = @{}
-            foreach ($ota in @($resp.objectTypeAttributes)) {
-                if ($ota.id -and $ota.name) {
-                    $attrDict[[string]$ota.id] = Fix-DoubleUtf8 ([string]$ota.name)
+            # Complétion du dictionnaire avec les attributs renvoyés dans la page
+            if ($resp.objectTypeAttributes) {
+                foreach ($ota in @($resp.objectTypeAttributes)) {
+                    if ($ota.id -and $ota.name) {
+                        $attrDict[[string]$ota.id] = [string]$ota.name
+                    }
                 }
             }
 
             foreach ($v in @($resp.values)) {
                 if (-not $v.id) { continue }
-                $out = @{}
+                
+                $out = @{
+                    "ObjectKey"      = [string]$v.objectKey
+                    "Nom"            = ""
+                    "Prénom"         = ""
+                    "Compte Jira"    = ""
+                    "Compte Jira ID" = ""
+                    "Type ressource" = "Inconnu"
+                    "Direction"      = "N/A"
+                    "Statut"         = "Inconnu"
+                    "Date Entrée"    = ""
+                    "Date Sortie"    = ""
+                    "Tarif € TTC"    = "Non défini"
+                }
 
                 foreach ($attr in @($v.attributes)) {
-                    # Résolution du nom via dictionnaire (gateway v1)
-                    $attrName = $null
-                    if ($attr.objectTypeAttributeId) {
+                    $attrName = ""
+                    
+                    # 1. Résolution du nom d'attribut
+                    if ($attr.objectTypeAttributeId -and $attrDict.ContainsKey([string]$attr.objectTypeAttributeId)) {
                         $attrName = $attrDict[[string]$attr.objectTypeAttributeId]
+                    } elseif ($attr.objectTypeAttribute -and $attr.objectTypeAttribute.name) {
+                        $attrName = [string]$attr.objectTypeAttribute.name
                     }
-                    # Fallback ancien format (si objectTypeAttribute embarqué)
-                    if (-not $attrName -and $attr.objectTypeAttribute -and $attr.objectTypeAttribute.name) {
-                        $attrName = Fix-DoubleUtf8 ([string]$attr.objectTypeAttribute.name)
-                    }
-                    if (-not $attrName) { continue }
+                    
+                    if ([string]::IsNullOrWhiteSpace($attrName)) { continue }
 
-                    $outputKey = $null
-                    foreach ($w in $wantedMap.Keys) {
-                        if ($attrName -eq $w) { $outputKey = $wantedMap[$w]; break }
-                    }
-                    if (-not $outputKey) { continue }
-
+                    # 2. Extraction des valeurs
                     $vals = $attr.objectAttributeValues
+                    if (-not $vals -or $vals.Count -eq 0) { continue }
+                    
+                    $v0 = $vals[0]
+                    $dispVal = if ($v0.displayValue) { [string]$v0.displayValue } elseif ($v0.value) { [string]$v0.value } else { "" }
 
-                    if ($outputKey -eq "Compte Jira") {
-                        if ($vals -and $vals.Count -gt 0) {
-                            $v0 = $vals[0]
-                            if ($v0.displayValue) { $out["Compte Jira"] = Fix-DoubleUtf8 ([string]$v0.displayValue) }
-                            if ($v0.user -and $v0.user.key) { $out["Compte Jira ID"] = [string]$v0.user.key }
+                    # 3. Mapping tolérant
+                    switch -Regex ($attrName) {
+                        "(?i)^Nom$" {
+                            $out["Nom"] = $dispVal
                         }
-                        continue
-                    }
-
-                    if ($vals -and $vals.Count -gt 0 -and $vals[0].displayValue) {
-                        $value = Fix-DoubleUtf8 ([string]$vals[0].displayValue)
-                        if ($dateAttrs -contains $outputKey) { $value = Normalize-AssetDate $value }
-                        if ($outputKey -eq "Date PLD") { $out["Date Sortie"] = $value }
-                        else { $out[$outputKey] = $value }
-                    } else {
-                        if ($outputKey -eq "Date PLD") { $out["Date Sortie"] = "" }
+                        "(?i)^Pr[ée]nom$" {
+                            $out["Prénom"] = $dispVal
+                        }
+                        "(?i)Compte\s*Jira\s*ID|^AccountId$" {
+                            if ($dispVal) { $out["Compte Jira ID"] = $dispVal }
+                        }
+                        "(?i)Compte\s*Jira|^Email$" {
+                            $out["Compte Jira"] = $dispVal
+                            if ($v0.user) {
+                                if ($v0.user.accountId) { 
+                                    $out["Compte Jira ID"] = [string]$v0.user.accountId 
+                                } elseif ($v0.user.key) { 
+                                    $out["Compte Jira ID"] = [string]$v0.user.key 
+                                }
+                            }
+                        }
+                        "(?i)Type.*ressource" {
+                            $out["Type ressource"] = $dispVal
+                        }
+                        "(?i)^Direction" {
+                            if (-not [string]::IsNullOrWhiteSpace($dispVal)) {
+                                $out["Direction"] = $dispVal
+                            }
+                        }
+                        "(?i)^Statut" {
+                            $out["Statut"] = $dispVal
+                        }
+                        "(?i)Date.*Entr[ée]e" {
+                            $out["Date Entrée"] = Normalize-AssetDate $dispVal
+                        }
+                        "(?i)Date.*Sortie|Date.*PLD" {
+                            $out["Date Sortie"] = Normalize-AssetDate $dispVal
+                        }
+                        "(?i)Tarif" {
+                            $out["Tarif € TTC"] = $dispVal
+                        }
                     }
                 }
 
-                if (-not $out.ContainsKey("Date Sortie"))  { $out["Date Sortie"] = "" }
-                if (-not $out.ContainsKey("Statut"))       { $out["Statut"] = "Inconnu" }
-                if (-not $out.ContainsKey("Tarif € TTC"))  { $out["Tarif € TTC"] = "Non défini" }
-                if (-not $out.ContainsKey("Prénom"))       { $out["Prénom"] = "" }
-                if (-not $out.ContainsKey("Date Entrée"))  { $out["Date Entrée"] = "" }
+                # Sécurité : Si Compte Jira ID n'a pas été capturé mais que le champ contient l'ID Atlassian
+                if ([string]::IsNullOrWhiteSpace($out["Compte Jira ID"]) -and $out["Compte Jira"] -match "([0-9a-f]{24}|[0-9a-f-]{36})") {
+                    $out["Compte Jira ID"] = $Matches[1]
+                }
 
-                if ($out.Keys.Count -gt 0) { $assetUsers += [pscustomobject]$out }
+                [void]$collectedUsers.Add([pscustomobject]$out)
             }
 
             $isLast  = [bool]$resp.isLast
             $startAt += $maxResults
-            Write-Info "Assets: $($assetUsers.Count) users chargés (startAt=$startAt, isLast=$isLast)"
             if ($startAt -gt 500000) { Write-Warn "Assets pagination anormale."; break }
         }
 
-        Save-Json -Path $assetsCacheFile -Object $assetUsers
+        Write-Progress -Activity "Récupération des Assets (CMDB)" -Completed
+        
+        # Conversion sûre en tableau PowerShell standard
+        $assetUsers = $collectedUsers.ToArray()
+        
+        if ($assetsCacheFile) {
+            Save-Json -Path $assetsCacheFile -Object $assetUsers
+        }
         Write-Info "Assets users sauvegardés: $($assetUsers.Count)"
     }
 }
-Write-Info "Assets users: $($assetUsers.Count)"
+
+# Indexation par Account ID
+$AssetByAccountId = @{}
+foreach ($u in $assetUsers) {
+    $aid = [string]$u."Compte Jira ID"
+    if (-not [string]::IsNullOrWhiteSpace($aid)) {
+        $AssetByAccountId[$aid] = $u
+    }
+    if ($u."Compte Jira") {
+        $AssetByAccountId[[string]$u."Compte Jira"] = $u
+    }
+}
+
+Write-Info "Assets users: $($assetUsers.Count) (Indexés par ID: $($AssetByAccountId.Count))"
 
 # ======================================================================
-# CHARGEMENT : ISSUES
+# CHARGEMENT : ISSUES (Parallélisation 10x + Barre de progression)
 # ======================================================================
 $issuesById = @{}
 if ($UseCache_Issues) {
@@ -576,26 +722,104 @@ if ($UseCache_Issues) {
     }
 }
 
-$issuesMissing = 0; $issuesSkipped = 0
+# 1. Extraction des tickets uniques référencés dans les worklogs
+$uniqueToFetch = @{}
+$issuesSkipped = 0
+
 foreach ($wl in $worklogs) {
     if (-not $wl.issue) { continue }
-    $issueId = [string]$wl.issue.id
-    $self    = [string]$wl.issue.self
-    if ([string]::IsNullOrWhiteSpace($issueId) -or [string]::IsNullOrWhiteSpace($self)) { continue }
-    if ($issuesById.ContainsKey($issueId)) { $issuesSkipped++; continue }
-    $issuesMissing++
-    try {
-        $issue = Invoke-ApiGet -Url $self -Headers $jiraHeaders
-        if ($issue -and $issue.id) { $issuesById[[string]$issue.id] = $issue }
-    } catch { Write-Warn "Issue $self : $($_.Exception.Message)" }
+    $iid  = [string]$wl.issue.id
+    $self = [string]$wl.issue.self
+    if ([string]::IsNullOrWhiteSpace($iid) -or [string]::IsNullOrWhiteSpace($self)) { continue }
+    
+    if ($issuesById.ContainsKey($iid)) {
+        $issuesSkipped++
+    } elseif (-not $uniqueToFetch.ContainsKey($iid)) {
+        $uniqueToFetch[$iid] = $self
+    }
 }
-Write-Info "Issues: $issuesSkipped en cache, $issuesMissing téléchargées, total=$($issuesById.Count)"
 
-# Tempo account metadata cache
-$tempoAccountMetaCache = @{}
-if ($UseCache_TempoAccounts) {
-    $c = Load-Json -Path $tempoAcctCache
-    if ($c) { foreach ($p in $c.PSObject.Properties) { $tempoAccountMetaCache[$p.Name] = $p.Value } }
+$totalToFetch = $uniqueToFetch.Count
+Write-Info "Tickets Jira : $issuesSkipped déjà en cache, $totalToFetch à télécharger..."
+
+# 2. Téléchargement multi-thread si des tickets sont manquants
+if ($totalToFetch -gt 0) {
+    $proxyUri = Get-EffectiveProxyUri -TargetUrl "https://jiradot.atlassian.net"
+    $maxThreads = 10
+    $pool = [runspacefactory]::CreateRunspacePool(1, $maxThreads)
+    $pool.Open()
+
+    $sb = {
+        param($id, $url, $headers, $proxy)
+        try {
+            [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 -bor [System.Net.SecurityProtocolType]::Tls13
+            $p = @{
+                Method      = 'GET'
+                Uri         = $url
+                Headers     = $headers
+                ContentType = 'application/json'
+                ErrorAction = 'Stop'
+                TimeoutSec  = 25
+            }
+            if ($proxy) {
+                $p.Proxy = $proxy
+                $p.ProxyUseDefaultCredentials = $true
+            }
+            $res = Invoke-RestMethod @p
+            return @{ Id = $id; Data = $res; Success = $true }
+        } catch {
+            return @{ Id = $id; Error = $_.Exception.Message; Success = $false }
+        }
+    }
+
+    $jobs = New-Object System.Collections.Generic.List[object]
+    foreach ($entry in $uniqueToFetch.GetEnumerator()) {
+        $ps = [powershell]::Create()
+        $ps.RunspacePool = $pool
+        [void]$ps.AddScript($sb)
+        [void]$ps.AddArgument($entry.Key)
+        [void]$ps.AddArgument($entry.Value)
+        [void]$ps.AddArgument($jiraHeaders)
+        [void]$ps.AddArgument($proxyUri)
+
+        $jobs.Add([pscustomobject]@{
+            PsHandle = $ps
+            Async    = $ps.BeginInvoke()
+            Id       = $entry.Key
+        })
+    }
+
+    # Suivi de la progression en direct
+    while ($true) {
+        $done = ($jobs | Where-Object { $_.Async.IsCompleted }).Count
+        $pct = [int](($done / [Math]::Max(1, $totalToFetch)) * 100)
+        
+        Write-Progress -Activity "Téléchargement des tickets Jira (Parallèle)" `
+                       -Status "Tickets récupérés : $done / $totalToFetch ($pct%)" `
+                       -PercentComplete $pct
+                       
+        if ($done -ge $totalToFetch) { break }
+        Start-Sleep -Milliseconds 200
+    }
+
+    # Récupération des résultats et fermeture propre
+    foreach ($j in $jobs) {
+        $res = $j.PsHandle.EndInvoke($j.Async)
+        $j.PsHandle.Dispose()
+        if ($res -and $res.Success -and $res.Data) {
+            $issuesById[[string]$res.Id] = $res.Data
+        }
+    }
+
+    $pool.Close()
+    $pool.Dispose()
+    Write-Progress -Activity "Téléchargement des tickets Jira (Parallèle)" -Completed
+
+    # Sauvegarde dans le cache JSON
+    Save-Json -Path $issuesCacheFile -Object $issuesById
+    Write-Info "Issues : $($issuesById.Count) tickets indexés et sauvegardés en cache."
+} else {
+    Write-Info "Issues : total=$($issuesById.Count) tickets prêts."
 }
 
 # ======================================================================
@@ -633,6 +857,62 @@ foreach ($k in $userTeamsMap.Keys)  { [void]$allUsers.Add($k) }
 foreach ($k in $userWorklogs.Keys)  { [void]$allUsers.Add($k) }
 
 # ======================================================================
+# CHARGEMENT : COMPTES TEMPO
+# ======================================================================
+$tempoAccountMetaCache = @{}
+
+# Si la variable de cache n'a pas été déclarée en haut de script, on définit le chemin par défaut
+if (-not $accountsCacheFile -and $cacheDir) {
+    $accountsCacheFile = Join-Path $cacheDir "cache_comptes_tempo.json"
+}
+
+if ($UseCache_ComptesTempo -and $accountsCacheFile) {
+    $cachedAccounts = Load-Json -Path $accountsCacheFile
+    if ($cachedAccounts) {
+        foreach ($p in $cachedAccounts.PSObject.Properties) {
+            $tempoAccountMetaCache[$p.Name] = $p.Value
+        }
+        Write-Info "Comptes Tempo cache: $($tempoAccountMetaCache.Count)"
+    }
+}
+
+if ($tempoAccountMetaCache.Count -eq 0) {
+    Write-Info "Récupération des comptes Tempo..."
+    $accUrl = "https://api.tempo.io/4/accounts"
+    while ($true) {
+        try {
+            $accResp = Invoke-ApiGet -Url $accUrl -Headers $tempoHeaders
+            if ($accResp.results) {
+                foreach ($acc in $accResp.results) {
+                    $accKey = [string]$acc.key
+                    $accId  = [string]$acc.id
+                    if ($accKey) { $tempoAccountMetaCache[$accKey] = $acc }
+                    if ($accId)  { $tempoAccountMetaCache[$accId]  = $acc }
+                }
+            }
+            if ($accResp.metadata -and $accResp.metadata.next) { 
+                $accUrl = $accResp.metadata.next 
+            } else { 
+                break 
+            }
+        } catch {
+            Write-Warn "Comptes Tempo : $($_.Exception.Message)"
+            break
+        }
+    }
+    if ($accountsCacheFile) {
+        Save-Json -Path $accountsCacheFile -Object $tempoAccountMetaCache
+    }
+    Write-Info "Comptes Tempo: $($tempoAccountMetaCache.Count)"
+}
+
+# Garantie anti-$null absolue
+if ($null -eq $tempoAccountMetaCache) {
+    $tempoAccountMetaCache = @{}
+}
+
+
+# ======================================================================
 # APPEL DES 5 FEUILLES
 # ======================================================================
 Write-Info "--- Construction Feuille 1 ---"
@@ -666,13 +946,15 @@ $resultF2 = Build-SaisiTempsTempo `
     -UserWorkloadDays $userWorkloadDays
 Write-Info "Feuille 2: $($resultF2.Rows.Count) lignes"
 
-Write-Info "--- Construction Feuille 3 ---"
+Write-Info "--- Construction Feuille 3 : Saisi Temps Asset ---"
 $resultF3 = Build-SaisiTempsAsset `
     -Worklogs $worklogs `
     -UserTeamsMap $userTeamsMap `
-    -AssetByAccountId $assetByAccountId `
+    -AssetByAccountId $AssetByAccountId `
     -WorkloadSchemeMap $workloadSchemeMap `
-    -WeekBuckets $weekBuckets
+    -WeekBuckets $weekBuckets `
+    -IssuesById $issuesById `
+    -JiraHeaders $jiraHeaders
 Write-Info "Feuille 3: $($resultF3.Rows.Count) lignes"
 
 Write-Info "--- Construction Feuille 4 ---"

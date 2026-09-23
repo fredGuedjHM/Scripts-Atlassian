@@ -28,12 +28,14 @@ function Write-ErrLog($msg) {
 }
 
 # ======================================================================
-# PROXY
+# PROXY & TLS
 # ======================================================================
 function Initialize-Proxy {
     param([switch]$UseSystemProxy, [string]$ProxyUrl)
     try {
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        # Support combiné TLS 1.2 et TLS 1.3
+        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 -bor [System.Net.SecurityProtocolType]::Tls13
+        
         if ($ProxyUrl) {
             [System.Net.WebRequest]::DefaultWebProxy = New-Object System.Net.WebProxy($ProxyUrl, $true)
             Write-Info "Proxy: $ProxyUrl"
@@ -51,7 +53,12 @@ function Get-EffectiveProxyUri {
     param([Parameter(Mandatory)][string]$TargetUrl)
     if ($script:ProxyUrl -and $script:ProxyUrl.Trim()) { return $script:ProxyUrl }
     if (-not $script:UseSystemProxy) { return $null }
-    try { $dest = [uri]$TargetUrl } catch { return $null }
+    
+    $dest = $null
+    if (-not [System.Uri]::TryCreate($TargetUrl, [System.UriKind]::Absolute, [ref]$dest)) {
+        return $null
+    }
+    
     $wp = [System.Net.WebRequest]::DefaultWebProxy
     if (-not $wp -or $wp.IsBypassed($dest)) { return $null }
     $proxy = $wp.GetProxy($dest)
@@ -60,7 +67,7 @@ function Get-EffectiveProxyUri {
 }
 
 # ======================================================================
-# HTTP WRAPPERS
+# HTTP WRAPPERS (Fiabilisés PowerShell 5.1 / ISE)
 # ======================================================================
 function Get-WebExceptionBody([System.Net.WebException]$ex) {
     try {
@@ -76,40 +83,70 @@ function Invoke-ApiGet {
     param([Parameter(Mandatory)][string]$Url,
           [Parameter(Mandatory)][hashtable]$Headers)
     Write-Log "GET $Url" "DEBUG"
-    $params = @{
-        Method='GET'; Uri=$Url; Headers=$Headers
-        ContentType='application/json'; ErrorAction='Stop'
+
+    if (-not $Headers.ContainsKey("User-Agent")) {
+        $Headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
+    if (-not $Headers.ContainsKey("Accept")) {
+        $Headers["Accept"] = "application/json"
+    }
+
+    $params = @{
+        Method      = 'GET'
+        Uri         = $Url
+        Headers     = $Headers
+        ContentType = 'application/json'
+        ErrorAction = 'Stop'
+        TimeoutSec  = 30
+    }
+
     $px = Get-EffectiveProxyUri -TargetUrl $Url
     if ($px) {
         $params.Proxy = $px
-        if ($script:ProxyUseDefaultCredentials) { $params.ProxyUseDefaultCredentials = $true }
+        $params.ProxyUseDefaultCredentials = $true
     }
-    try { return Invoke-RestMethod @params }
+
+    try { 
+        return Invoke-RestMethod @params 
+    }
     catch [System.Net.WebException] {
         $body = Get-WebExceptionBody $_.Exception
-        if ($body) { Write-ErrLog "GET $Url : $($_.Exception.Message)`nBody:`n$body" }
-        else       { Write-ErrLog "GET $Url : $($_.Exception.Message)" }
+        # Log technique dans le fichier .log sans faire crier la console en rouge
+        if ($body) { Write-Log "GET $Url : $($_.Exception.Message) | Body: $body" "WARN" }
+        else       { Write-Log "GET $Url : $($_.Exception.Message)" "WARN" }
         throw
     }
 }
+
 
 function Invoke-AssetsAqlPost {
     param([Parameter(Mandatory)][string]$Url,
           [Parameter(Mandatory)][hashtable]$Headers,
           [Parameter(Mandatory)][string]$AqlQuery)
     Write-Log "POST Assets $Url | AQL: $AqlQuery" "DEBUG"
+    
+    if (-not $Headers.ContainsKey("User-Agent")) {
+        $Headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+
     $jsonBody = '{"qlQuery": "' + $AqlQuery + '"}'
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($jsonBody)
     $params = @{
-        Method='POST'; Uri=$Url; Headers=$Headers; Body=$bytes
-        ContentType='application/json; charset=utf-8'; ErrorAction='Stop'
+        Method      = 'POST'
+        Uri         = $Url
+        Headers     = $Headers
+        Body        = $bytes
+        ContentType = 'application/json; charset=utf-8'
+        ErrorAction = 'Stop'
+        TimeoutSec  = 30
     }
+
     $px = Get-EffectiveProxyUri -TargetUrl $Url
     if ($px) {
         $params.Proxy = $px
-        if ($script:ProxyUseDefaultCredentials) { $params.ProxyUseDefaultCredentials = $true }
+        $params.ProxyUseDefaultCredentials = $true
     }
+
     try { return Invoke-RestMethod @params }
     catch [System.Net.WebException] {
         $body = Get-WebExceptionBody $_.Exception
@@ -426,7 +463,6 @@ function Load-WorkloadSchemeDays {
         [Parameter(Mandatory)][string]$CacheFilePath,
         [Parameter(Mandatory)][bool]$UseCache
     )
-    # Retourne : @{ accountId = @{ monday=8.0; tuesday=8.0; ... } }
     $userDaysMap = @{}
 
     if ($UseCache) {
@@ -451,13 +487,11 @@ function Load-WorkloadSchemeDays {
             $schemeId   = [string]$ws.id
             $schemeName = Fix-DoubleUtf8 ([string]$ws.name)
 
-            # Défaut temps plein
             $days = @{
                 monday=8.0; tuesday=8.0; wednesday=8.0
                 thursday=8.0; friday=8.0; saturday=0.0; sunday=0.0
             }
 
-            # Récupérer le détail du scheme (jours + heures)
             try {
                 $detail = Invoke-ApiGet `
                     -Url "https://api.tempo.io/4/workload-schemes/$schemeId" `
@@ -465,13 +499,10 @@ function Load-WorkloadSchemeDays {
 
                 if ($detail.days) {
                     foreach ($dayName in @("monday","tuesday","wednesday","thursday","friday","saturday","sunday")) {
-                        # Tenter accès direct (minuscule)
                         $dayProp = $detail.days.$dayName
-                        # Tenter majuscule si pas trouvé
                         if ($null -eq $dayProp) {
                             $dayProp = $detail.days.($dayName.Substring(0,1).ToUpper() + $dayName.Substring(1))
                         }
-                        # Tenter tout majuscule
                         if ($null -eq $dayProp) {
                             $dayProp = $detail.days.($dayName.ToUpper())
                         }
@@ -493,7 +524,6 @@ function Load-WorkloadSchemeDays {
                 Write-Warn "Workload scheme detail $schemeId ($schemeName): $($_.Exception.Message)"
             }
 
-            # Récupérer les membres du scheme
             try {
                 $mResp = Invoke-ApiGet `
                     -Url "https://api.tempo.io/4/workload-schemes/$schemeId/members" `
@@ -531,7 +561,6 @@ function Get-ExpectedHoursFromWorkload {
         [Parameter(Mandatory)]$JoursFeries
     )
 
-    # --- Date d'entrée effective (depuis Assets) ---
     $effFrom = $PeriodeFrom
     if ($AssetByAccountId.ContainsKey($AccountId)) {
         $deStr = [string]$AssetByAccountId[$AccountId]."Date Entrée"
@@ -550,7 +579,6 @@ function Get-ExpectedHoursFromWorkload {
         }
     }
 
-    # --- Date de sortie effective (depuis Tempo team MemberDates) ---
     $effTo = $PeriodeTo
     if ($null -ne $MemberDates) {
         $dStr = ""
@@ -567,7 +595,6 @@ function Get-ExpectedHoursFromWorkload {
         }
     }
 
-    # --- Date de sortie Assets ---
     if ($AssetByAccountId.ContainsKey($AccountId)) {
         $dsStr = [string]$AssetByAccountId[$AccountId]."Date Sortie"
         if (-not [string]::IsNullOrWhiteSpace($dsStr)) {
@@ -580,10 +607,8 @@ function Get-ExpectedHoursFromWorkload {
         }
     }
 
-    # --- Hors période ? ---
     if ($effFrom.Date -gt $effTo.Date) { return -1 }
 
-    # --- Workload de la personne (ou défaut 8h L-V) ---
     $days = @{
         monday=8.0; tuesday=8.0; wednesday=8.0
         thursday=8.0; friday=8.0; saturday=0.0; sunday=0.0
@@ -592,7 +617,6 @@ function Get-ExpectedHoursFromWorkload {
         $days = $UserWorkloadDays[$AccountId]
     }
 
-    # --- Map DayOfWeek → clé Tempo ---
     $dayNameMap = @{
         [DayOfWeek]::Monday    = "monday"
         [DayOfWeek]::Tuesday   = "tuesday"
@@ -603,7 +627,6 @@ function Get-ExpectedHoursFromWorkload {
         [DayOfWeek]::Sunday    = "sunday"
     }
 
-    # --- Calcul jour par jour ---
     $totalHours = 0.0
     $d = $effFrom.Date
     while ($d -le $effTo.Date) {

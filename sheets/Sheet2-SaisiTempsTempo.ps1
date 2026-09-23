@@ -1,9 +1,8 @@
-﻿<#
-Sheet2-SaisiTempsTempo.ps1 v2
+<#
+Sheet2-SaisiTempsTempo.ps1 v2 (Optimisé)
 Feuille 2 : Synthèse de saisie par équipe Tempo.
-Utilise Get-ExpectedHoursFromWorkload (Common.ps1) pour le prorata
-basé sur le Workload Scheme de chaque personne.
-Détecte la saisie excessive (> heures attendues, sans tolérance).
+Utilise Get-ExpectedHoursFromWorkload (Common.ps1) pour le prorata.
+Mémoïsation des calculs d'heures attendues + Barre de progression.
 #>
 
 function Build-SaisiTempsTempo {
@@ -25,8 +24,19 @@ function Build-SaisiTempsTempo {
     )
 
     $rows = New-Object System.Collections.Generic.List[object]
+    $expectedHoursCache = @{}
+    $teamTotal = $TeamsData.Count
+    $teamIdx = 0
 
     foreach ($t in $TeamsData) {
+        $teamIdx++
+        if ($teamIdx % 5 -eq 0 -or $teamIdx -eq $teamTotal) {
+            $pct = [int](($teamIdx / [Math]::Max(1, $teamTotal)) * 100)
+            Write-Progress -Activity "Construction Feuille 2 (Synthèse Équipes Tempo)" `
+                           -Status "Équipe $teamIdx / $teamTotal : $($t.Nom)" `
+                           -PercentComplete $pct
+        }
+
         $memberIdsStr = [string]$t."Membres ID"
         $members = @()
         if ($memberIdsStr) { $members = $memberIdsStr -split ",\s*" }
@@ -40,14 +50,30 @@ function Build-SaisiTempsTempo {
         $horsperiode  = 0
 
         foreach ($m in $members) {
-            $heuresPerso = Get-ExpectedHoursFromWorkload `
-                -AccountId $m `
-                -UserWorkloadDays $UserWorkloadDays `
-                -AssetByAccountId $AssetByAccountId `
-                -MemberDates $memberDates `
-                -PeriodeFrom $PeriodeFrom `
-                -PeriodeTo $PeriodeTo `
-                -JoursFeries $JoursFeries
+            # Clé de cache incluant l'éventuelle date de sortie d'équipe
+                        $mExit = ""
+            if ($memberDates) {
+                if ($memberDates -is [System.Collections.IDictionary]) {
+                    if ($memberDates.Contains($m)) { $mExit = [string]$memberDates[$m] }
+                } elseif ($memberDates.PSObject -and $memberDates.PSObject.Properties[$m]) {
+                    $mExit = [string]$memberDates.PSObject.Properties[$m].Value
+                }
+            }
+            $cacheKey = "$m|$mExit"
+
+            if ($expectedHoursCache.ContainsKey($cacheKey)) {
+                $heuresPerso = $expectedHoursCache[$cacheKey]
+            } else {
+                $heuresPerso = Get-ExpectedHoursFromWorkload `
+                    -AccountId $m `
+                    -UserWorkloadDays $UserWorkloadDays `
+                    -AssetByAccountId $AssetByAccountId `
+                    -MemberDates $memberDates `
+                    -PeriodeFrom $PeriodeFrom `
+                    -PeriodeTo $PeriodeTo `
+                    -JoursFeries $JoursFeries
+                $expectedHoursCache[$cacheKey] = $heuresPerso
+            }
 
             if ($heuresPerso -eq -1) {
                 $horsperiode++
@@ -91,11 +117,9 @@ function Build-SaisiTempsTempo {
             "Saisie excessive"  = $excessive
             "Saisie Incorrecte" = ($aucuneSaisie + $incomplete + $excessive)
         }) | Out-Null
-
-        if ($horsperiode -gt 0) {
-            Write-Log "F2: équipe $($t.Nom) — $horsperiode membre(s) hors période exclus" "DEBUG"
-        }
     }
 
+    Write-Progress -Activity "Construction Feuille 2 (Synthèse Équipes Tempo)" -Completed
     return @{ Headers = $headers; Rows = $rows }
 }
+
